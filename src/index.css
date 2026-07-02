@@ -1,0 +1,31 @@
+:root {
+  font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+  color: #1f2937;
+  background: #eaf0f7;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-width: 100%;
+  min-height: 100%;
+  margin: 0;
+}
+
+button:hover {
+  border-color: #4b63ff;
+  color: #1d4ed8;
+}
+
+button:focus-visible {
+  outline: 3px solid rgba(75, 99, 255, 0.28);
+  outline-offset: 2px;
+}
