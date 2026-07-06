@@ -1,6 +1,26 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { createSampleProject } from "../domain/defaultProject";
+import { deriveEdgeStyle, nodeKindOptions, relationLabel } from "../domain/legalSchema";
+import type {
+  DiagramProject,
+  LegalRelationKind,
+  LegalStatus,
+} from "../domain/types";
+import { BottomPanel, type BottomPanelTab } from "./shell/BottomPanel";
+import { CanvasFrame } from "./canvas/CanvasFrame";
+import { ConfirmDialog, type ConfirmRequest } from "./shell/ConfirmDialog";
+import { DraftRecoveryBar } from "./shell/DraftRecoveryBar";
+import { LeftPalette } from "./shell/LeftPalette";
+import { ToastHost, type ToastMessage } from "./shell/ToastHost";
+import { TopBar } from "./shell/TopBar";
+import { Inspector } from "./inspector/Inspector";
+import { exportPngFile } from "../services/exportPng";
+import { exportSvgFile } from "../services/exportSvg";
+import { normalizeDiagramProject, projectFileBaseName } from "../services/importExportJson";
+import { clearProjectDraft, loadProjectDraft, saveProjectDraft } from "../services/persistence";
+import { validateDiagramProject } from "../utils/validation";
 
-type NodeKind = "subject" | "object" | "dispute" | "case" | "note";
+type NodeKind = "subject" | "object" | "dispute" | "case" | "evidence" | "note";
 type AnchorSide = "top" | "right" | "bottom" | "left" | "center";
 type Point = { x: number; y: number };
 
@@ -25,6 +45,10 @@ type DiagramNode = {
   bodyFontSize?: number;
   textAlign?: "center" | "left";
   boldTitle?: boolean;
+  role?: string;
+  note?: string;
+  locked?: boolean;
+  visible?: boolean;
 };
 
 type DiagramEdge = {
@@ -52,6 +76,14 @@ type DiagramEdge = {
   stroke?: string;
   strokeWidth?: number;
   marker?: boolean;
+  relationKind?: LegalRelationKind;
+  legalStatus?: LegalStatus;
+  basis?: string;
+  amount?: string;
+  date?: string;
+  sourceDocument?: string;
+  visible?: boolean;
+  editorOnly?: boolean;
 };
 
 type TimelineItem = {
@@ -151,6 +183,10 @@ const styleMap = {
   case: {
     fill: "#F0FFF8",
     stroke: "#00A86B",
+  },
+  evidence: {
+    fill: "#F8FAFC",
+    stroke: "#64748B",
   },
   label: {
     fill: "#F4D8FF",
@@ -648,6 +684,22 @@ const defaultDiagramData: DiagramData = {
   legendItems: defaultLegendItems,
 };
 
+function prepareInitialData(data: DiagramData): DiagramData {
+  const cloned = cloneDiagramData(data);
+  return {
+    ...cloned,
+    edges: cloned.edges.map((edge) =>
+      edge.opacity === 0
+        ? {
+            ...edge,
+            opacity: undefined,
+            visible: false,
+          }
+        : edge,
+    ),
+  };
+}
+
 function cloneDiagramData(data: DiagramData): DiagramData {
   return JSON.parse(JSON.stringify(data)) as DiagramData;
 }
@@ -1081,12 +1133,20 @@ function NodeCard({
   node,
   selected,
   editable,
+  editing,
   onPointerDown,
+  onDoubleClick,
+  onTextChange,
+  onEndTextEdit,
 }: {
   node: DiagramNode;
   selected: boolean;
   editable: boolean;
+  editing: boolean;
   onPointerDown: (event: React.PointerEvent<SVGGElement>) => void;
+  onDoubleClick: (event: React.MouseEvent<SVGGElement>) => void;
+  onTextChange: (value: string) => void;
+  onEndTextEdit: () => void;
 }) {
   const style = getNodeStyle(node.type);
   const isCore = node.id === "core";
@@ -1094,6 +1154,7 @@ function NodeCard({
   return (
     <g
       onPointerDown={editable ? onPointerDown : undefined}
+      onDoubleClick={editable ? onDoubleClick : undefined}
       style={{ cursor: editable ? "move" : "default" }}
     >
       <rect
@@ -1106,7 +1167,39 @@ function NodeCard({
         stroke={selected ? styleMap.selected.stroke : style.stroke}
         strokeWidth={selected ? 3 : isCore ? 2.6 : node.type === "dispute" ? 2 : 1.6}
       />
-      <NodeText node={node} />
+      {editing ? (
+        <foreignObject
+          data-editor-only="true"
+          x={node.x + 12}
+          y={node.y + 12}
+          width={Math.max(80, node.width - 24)}
+          height={Math.max(48, node.height - 24)}
+        >
+          <textarea
+            autoFocus
+            value={node.text}
+            onChange={(event) => onTextChange(event.target.value)}
+            onBlur={onEndTextEdit}
+            onPointerDown={(event) => event.stopPropagation()}
+            style={{
+              width: "100%",
+              height: "100%",
+              border: "1px solid #93C5FD",
+              borderRadius: 6,
+              padding: 8,
+              resize: "none",
+              boxSizing: "border-box",
+              fontFamily,
+              fontSize: 15,
+              lineHeight: 1.35,
+              color: styleMap.page.text,
+              background: "#FFFFFF",
+            }}
+          />
+        </foreignObject>
+      ) : (
+        <NodeText node={node} />
+      )}
       {selected && (
         <rect
           data-editor-only="true"
@@ -1139,6 +1232,7 @@ function EdgePath({
   editable: boolean;
   onSelect: (event: React.PointerEvent<SVGPathElement>) => void;
 }) {
+  const derivedStyle = deriveEdgeStyle(edge);
   return (
     <g>
       {editable && path && (
@@ -1158,11 +1252,11 @@ function EdgePath({
       <path
         d={path}
         fill="none"
-        stroke={selected ? styleMap.selected.stroke : edge.stroke ?? styleMap.edge.stroke}
-        strokeWidth={selected ? 3 : edge.strokeWidth ?? 1.9}
+        stroke={selected ? styleMap.selected.stroke : derivedStyle.stroke}
+        strokeWidth={selected ? 3 : derivedStyle.strokeWidth}
         strokeLinecap="round"
         strokeLinejoin="round"
-        strokeDasharray={edge.dashed ? "7 7" : undefined}
+        strokeDasharray={derivedStyle.dashed ? "7 7" : undefined}
         markerEnd={edge.marker === false ? undefined : "url(#arrow)"}
         opacity={edge.opacity ?? 0.85}
       />
@@ -1874,36 +1968,44 @@ export default function LegalRelationshipDiagram() {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const dragRef = useRef<DragState | null>(null);
-  const [diagramData, setDiagramData] = useState<DiagramData>(() =>
-    cloneDiagramData(defaultDiagramData),
+  const [project, setProject] = useState<DiagramProject>(() =>
+    createSampleProject(prepareInitialData(defaultDiagramData)),
   );
+  const diagramData = project.data as DiagramData;
+  const projectRef = useRef(project);
   const diagramDataRef = useRef(diagramData);
   const [selected, setSelected] = useState<Selection>(null);
   const [editMode, setEditMode] = useState(false);
   const [showGrid, setShowGrid] = useState(true);
   const [snapToGrid, setSnapToGrid] = useState(true);
   const [smartAlign, setSmartAlign] = useState(true);
+  const [zoom, setZoom] = useState(1);
+  const [relationMode, setRelationMode] = useState(false);
+  const [relationCreateFrom, setRelationCreateFrom] = useState<string | undefined>();
+  const [selectedRelationKind, setSelectedRelationKind] =
+    useState<LegalRelationKind>("contract");
+  const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
+  const [bottomTab, setBottomTab] = useState<BottomPanelTab>("validation");
+  const [draftProject, setDraftProject] = useState<DiagramProject | null>(null);
+  const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const [confirmRequest, setConfirmRequest] = useState<
+    { request: ConfirmRequest; onConfirm: () => void } | null
+  >(null);
   const [past, setPast] = useState<DiagramData[]>([]);
   const [future, setFuture] = useState<DiagramData[]>([]);
 
   useEffect(() => {
+    projectRef.current = project;
     diagramDataRef.current = diagramData;
-  }, [diagramData]);
+  }, [project, diagramData]);
 
   useEffect(() => {
-    const saved = localStorage.getItem(LOCAL_STORAGE_KEY);
-    if (!saved) return;
-
-    try {
-      const parsed = normalizeDiagramData(JSON.parse(saved));
-      if (window.confirm("检测到本地保存版本，是否恢复？")) {
-        setDiagramData(parsed);
-        diagramDataRef.current = parsed;
-      }
-    } catch {
-      localStorage.removeItem(LOCAL_STORAGE_KEY);
-    }
+    setDraftProject(loadProjectDraft());
   }, []);
+
+  useEffect(() => {
+    document.title = project.title;
+  }, [project.title]);
 
   const nodeMap = useMemo(
     () => new Map(diagramData.nodes.map((node) => [node.id, node])),
@@ -1912,11 +2014,13 @@ export default function LegalRelationshipDiagram() {
 
   const renderedEdges = useMemo<RenderedEdge[]>(
     () =>
-      diagramData.edges.map((edge) => ({
-        ...edge,
-        renderedPath: getRenderedPath(edge, nodeMap),
-        editablePoints: editableEdgePoints(edge, nodeMap),
-      })),
+      diagramData.edges
+        .filter((edge) => edge.visible !== false)
+        .map((edge) => ({
+          ...edge,
+          renderedPath: getRenderedPath(edge, nodeMap),
+          editablePoints: editableEdgePoints(edge, nodeMap),
+        })),
     [diagramData.edges, nodeMap],
   );
 
@@ -1931,6 +2035,25 @@ export default function LegalRelationshipDiagram() {
   const selectedRenderedEdge = selectedEdge
     ? renderedEdges.find((edge) => edge.id === selectedEdge.id)
     : undefined;
+  const validationIssues = useMemo(
+    () => validateDiagramProject(project),
+    [project],
+  );
+  const projectJsonText = useMemo(
+    () => JSON.stringify(project, null, 2),
+    [project],
+  );
+
+  function replaceProjectData(nextData: DiagramData) {
+    const nextProject = {
+      ...projectRef.current,
+      data: nextData,
+      updatedAt: new Date().toISOString(),
+    };
+    projectRef.current = nextProject;
+    diagramDataRef.current = nextData;
+    setProject(nextProject);
+  }
 
   function applyData(nextData: DiagramData, recordHistory = true, historyBase?: DiagramData) {
     const previous = historyBase ?? diagramDataRef.current;
@@ -1938,8 +2061,7 @@ export default function LegalRelationshipDiagram() {
       setPast((items) => [...items.slice(-79), cloneDiagramData(previous)]);
       setFuture([]);
     }
-    diagramDataRef.current = nextData;
-    setDiagramData(nextData);
+    replaceProjectData(nextData);
   }
 
   function updateData(
@@ -1970,23 +2092,138 @@ export default function LegalRelationshipDiagram() {
     }));
   }
 
-  function deleteNode(id: string) {
-    if (!window.confirm(`确认删除节点 ${id}？相关连线也会删除。`)) return;
+  function updateProject(patch: Partial<DiagramProject>) {
+    setProject((current) => {
+      const nextProject = {
+        ...current,
+        ...patch,
+        updatedAt: new Date().toISOString(),
+      };
+      projectRef.current = nextProject;
+      diagramDataRef.current = nextProject.data as DiagramData;
+      return nextProject;
+    });
+  }
+
+  function updateCanvas(patch: Partial<DiagramProject["canvas"]>) {
+    setProject((current) => {
+      const nextProject = {
+        ...current,
+        canvas: { ...current.canvas, ...patch },
+        updatedAt: new Date().toISOString(),
+      };
+      projectRef.current = nextProject;
+      return nextProject;
+    });
+  }
+
+  function showToast(text: string, tone: ToastMessage["tone"] = "info") {
+    const toast = { id: `toast-${Date.now()}-${Math.random()}`, text, tone };
+    setToasts((items) => [...items, toast]);
+    window.setTimeout(() => {
+      setToasts((items) => items.filter((item) => item.id !== toast.id));
+    }, 2600);
+  }
+
+  function requestConfirmation(request: ConfirmRequest, onConfirm: () => void) {
+    setConfirmRequest({ request, onConfirm });
+  }
+
+  function generateUniqueId(prefix: string, existingIds: string[]) {
+    let index = existingIds.length + 1;
+    let id = `${prefix}-${index}`;
+    const seen = new Set(existingIds);
+    while (seen.has(id)) {
+      index += 1;
+      id = `${prefix}-${index}`;
+    }
+    return id;
+  }
+
+  function addNode(kind: NodeKind) {
+    const option = nodeKindOptions.find((item) => item.value === kind);
+    const existingIds = diagramDataRef.current.nodes.map((node) => node.id);
+    const id = generateUniqueId(kind, existingIds);
+    const offset = existingIds.length * 18;
+    const node: DiagramNode = {
+      id,
+      type: kind,
+      x: snap(140 + offset, snapToGrid),
+      y: snap(120 + offset, snapToGrid),
+      width: kind === "dispute" ? 340 : 260,
+      height: kind === "dispute" ? 110 : 90,
+      text: option?.defaultText ?? "新节点",
+    };
+
     updateData((data) => ({
       ...data,
-      nodes: data.nodes.filter((node) => node.id !== id),
-      edges: data.edges.filter((edge) => edge.from !== id && edge.to !== id),
+      nodes: [...data.nodes, node],
     }));
-    setSelected(null);
+    setSelected({ type: "node", id });
+    setEditMode(true);
+    showToast("已新增节点。", "success");
+  }
+
+  function createRelation(from: string, to: string) {
+    const existingIds = diagramDataRef.current.edges.map((edge) => edge.id);
+    const id = generateUniqueId("relation", existingIds);
+    const edge: DiagramEdge = {
+      id,
+      from,
+      to,
+      fromSide: "right",
+      toSide: "left",
+      relationKind: selectedRelationKind,
+      legalStatus: selectedRelationKind === "dispute" ? "disputed" : "confirmed",
+      label: relationLabel(selectedRelationKind),
+      labelH: 38,
+    };
+
+    updateData((data) => ({
+      ...data,
+      edges: [...data.edges, edge],
+    }));
+    setSelected({ type: "edge", id });
+    setRelationMode(false);
+    setRelationCreateFrom(undefined);
+    showToast("已新增关系线。", "success");
+  }
+
+  function deleteNode(id: string) {
+    requestConfirmation(
+      {
+        title: "删除节点",
+        message: `确认删除节点 ${id}？相关连线也会删除。`,
+        confirmText: "删除",
+      },
+      () => {
+        updateData((data) => ({
+          ...data,
+          nodes: data.nodes.filter((node) => node.id !== id),
+          edges: data.edges.filter((edge) => edge.from !== id && edge.to !== id),
+        }));
+        setSelected(null);
+        showToast("节点已删除。", "success");
+      },
+    );
   }
 
   function deleteEdge(id: string) {
-    if (!window.confirm(`确认删除关系 ${id}？`)) return;
-    updateData((data) => ({
-      ...data,
-      edges: data.edges.filter((edge) => edge.id !== id),
-    }));
-    setSelected(null);
+    requestConfirmation(
+      {
+        title: "删除关系",
+        message: `确认删除关系 ${id}？`,
+        confirmText: "删除",
+      },
+      () => {
+        updateData((data) => ({
+          ...data,
+          edges: data.edges.filter((edge) => edge.id !== id),
+        }));
+        setSelected(null);
+        showToast("关系已删除。", "success");
+      },
+    );
   }
 
   function undo() {
@@ -1996,8 +2233,14 @@ export default function LegalRelationshipDiagram() {
       const current = cloneDiagramData(diagramDataRef.current);
       setFuture((futureItems) => [current, ...futureItems]);
       const nextData = cloneDiagramData(previous);
+      const nextProject = {
+        ...projectRef.current,
+        data: nextData,
+        updatedAt: new Date().toISOString(),
+      };
+      projectRef.current = nextProject;
       diagramDataRef.current = nextData;
-      setDiagramData(nextData);
+      setProject(nextProject);
       return items.slice(0, -1);
     });
   }
@@ -2009,8 +2252,14 @@ export default function LegalRelationshipDiagram() {
       const current = cloneDiagramData(diagramDataRef.current);
       setPast((pastItems) => [...pastItems.slice(-79), current]);
       const nextData = cloneDiagramData(next);
+      const nextProject = {
+        ...projectRef.current,
+        data: nextData,
+        updatedAt: new Date().toISOString(),
+      };
+      projectRef.current = nextProject;
       diagramDataRef.current = nextData;
-      setDiagramData(nextData);
+      setProject(nextProject);
       return items.slice(1);
     });
   }
@@ -2030,6 +2279,18 @@ export default function LegalRelationshipDiagram() {
   function beginNodeDrag(node: DiagramNode, event: React.PointerEvent<SVGGElement>) {
     if (!editMode) return;
     event.stopPropagation();
+    if (relationMode) {
+      if (!relationCreateFrom) {
+        setRelationCreateFrom(node.id);
+        setSelected({ type: "node", id: node.id });
+        showToast("已选择关系起点，请点击终点节点。", "info");
+      } else if (relationCreateFrom === node.id) {
+        showToast("起点和终点不能是同一个节点。", "error");
+      } else {
+        createRelation(relationCreateFrom, node.id);
+      }
+      return;
+    }
     const point = getSvgPoint(event);
     setSelected({ type: "node", id: node.id });
     dragRef.current = {
@@ -2093,8 +2354,7 @@ export default function LegalRelationshipDiagram() {
           }
         : item,
     );
-    diagramDataRef.current = nextData;
-    setDiagramData(nextData);
+    replaceProjectData(nextData);
     return nextData;
   }
 
@@ -2232,8 +2492,7 @@ export default function LegalRelationshipDiagram() {
       });
     }
 
-    diagramDataRef.current = nextData;
-    setDiagramData(nextData);
+    replaceProjectData(nextData);
   }
 
   function endDrag() {
@@ -2249,56 +2508,27 @@ export default function LegalRelationshipDiagram() {
 
   function exportSvg() {
     if (!svgRef.current) return;
-    const svgText = serializeSvg(svgRef.current);
-    downloadBlob(
-      new Blob([svgText], { type: "image/svg+xml;charset=utf-8" }),
-      "华贺库粮食短缺及多方权利主张关系图.svg",
-    );
+    exportSvgFile(svgRef.current, project.title, project.canvas.width, project.canvas.height);
+    showToast("SVG 已导出。", "success");
   }
 
   function exportPng() {
     if (!svgRef.current) return;
-    const svgText = serializeSvg(svgRef.current);
-    const svgBlob = new Blob([svgText], {
-      type: "image/svg+xml;charset=utf-8",
-    });
-    const url = URL.createObjectURL(svgBlob);
-    const image = new Image();
-
-    image.onload = () => {
-      const scale = 2;
-      const canvas = document.createElement("canvas");
-      canvas.width = CANVAS.width * scale;
-      canvas.height = CANVAS.height * scale;
-      const ctx = canvas.getContext("2d");
-
-      if (!ctx) {
-        URL.revokeObjectURL(url);
-        return;
-      }
-
-      ctx.fillStyle = "#FFFFFF";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-      canvas.toBlob((blob) => {
-        if (blob) {
-          downloadBlob(blob, "华贺库粮食短缺及多方权利主张关系图.png");
-        }
-        URL.revokeObjectURL(url);
-      }, "image/png");
-    };
-
-    image.onerror = () => URL.revokeObjectURL(url);
-    image.src = url;
+    void exportPngFile(svgRef.current, project.title, project.canvas.width, project.canvas.height)
+      .then(() => showToast("PNG 已导出。", "success"))
+      .catch((error) =>
+        showToast(error instanceof Error ? error.message : "PNG 导出失败。", "error"),
+      );
   }
 
   function exportJson() {
     downloadBlob(
-      new Blob([JSON.stringify(diagramData, null, 2)], {
+      new Blob([JSON.stringify(project, null, 2)], {
         type: "application/json;charset=utf-8",
       }),
-      "legal-diagram-data.json",
+      `${projectFileBaseName(project.title)}.json`,
     );
+    showToast("JSON 已导出。", "success");
   }
 
   function importJsonFile(event: React.ChangeEvent<HTMLInputElement>) {
@@ -2309,26 +2539,50 @@ export default function LegalRelationshipDiagram() {
     const reader = new FileReader();
     reader.onload = () => {
       try {
-        const parsed = normalizeDiagramData(JSON.parse(String(reader.result)));
-        applyData(parsed);
+        const parsed = normalizeDiagramProject(JSON.parse(String(reader.result)));
+        const nextProject = {
+          ...parsed,
+          updatedAt: new Date().toISOString(),
+        };
+        projectRef.current = nextProject;
+        diagramDataRef.current = nextProject.data as DiagramData;
+        setProject(nextProject);
+        setPast([]);
+        setFuture([]);
         setSelected(null);
-        window.alert("JSON 已导入。");
+        showToast("JSON 已导入。", "success");
       } catch (error) {
-        window.alert(error instanceof Error ? error.message : "JSON 格式不正确。");
+        showToast(error instanceof Error ? error.message : "JSON 格式不正确。", "error");
       }
     };
     reader.readAsText(file, "utf-8");
   }
 
   function saveLocal() {
-    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(diagramData, null, 2));
-    window.alert("已保存到本地，刷新后可恢复。");
+    saveProjectDraft(project);
+    setDraftProject(null);
+    showToast("已保存到本地。", "success");
   }
 
   function resetDefault() {
-    if (!window.confirm("确认重置为默认数据？当前未导出的修改会丢失。")) return;
-    applyData(cloneDiagramData(defaultDiagramData));
-    setSelected(null);
+    requestConfirmation(
+      {
+        title: "重置项目",
+        message: "确认重置为默认示例项目？当前未导出的修改会丢失。",
+        confirmText: "重置",
+      },
+      () => {
+        const nextProject = createSampleProject(prepareInitialData(defaultDiagramData));
+        projectRef.current = nextProject;
+        diagramDataRef.current = nextProject.data as DiagramData;
+        setProject(nextProject);
+        setPast([]);
+        setFuture([]);
+        setSelected(null);
+        clearProjectDraft();
+        showToast("已重置为默认项目。", "success");
+      },
+    );
   }
 
   return (
@@ -2338,98 +2592,94 @@ export default function LegalRelationshipDiagram() {
         background: styleMap.page.background,
         color: styleMap.page.text,
         fontFamily,
-        padding: 24,
+        padding: 18,
         boxSizing: "border-box",
       }}
     >
-      <div
-        style={{
-          margin: "0 auto 14px",
-          display: "flex",
-          alignItems: "flex-start",
-          justifyContent: "space-between",
-          gap: 16,
-        }}
-      >
-        <div>
-          <h1 style={{ margin: 0, fontSize: 26, lineHeight: 1.35 }}>
-            华贺库粮食短缺及多方权利主张关系图
-          </h1>
-          <p
-            style={{
-              margin: "6px 0 0",
-              fontSize: 14,
-              color: styleMap.page.mutedText,
-            }}
-          >
-            编辑器版：拖动节点、紫色标签和连线控制点；小方块可插入新折点。
-          </p>
-        </div>
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "flex-end" }}>
-          <ToolbarButton onClick={exportSvg}>导出 SVG</ToolbarButton>
-          <ToolbarButton onClick={exportPng}>导出 PNG</ToolbarButton>
-        </div>
-      </div>
-
-      <div style={toolbarStyle}>
-        <ToolbarButton active={editMode} onClick={() => setEditMode((value) => !value)}>
-          {editMode ? "预览模式" : "编辑模式"}
-        </ToolbarButton>
-        <ToolbarButton onClick={saveLocal}>保存到本地</ToolbarButton>
-        <ToolbarButton onClick={exportJson}>导出 JSON</ToolbarButton>
-        <ToolbarButton onClick={() => fileInputRef.current?.click()}>导入 JSON</ToolbarButton>
-        <ToolbarButton onClick={resetDefault}>重置为默认数据</ToolbarButton>
-        <ToolbarButton onClick={undo} disabled={!past.length}>撤销</ToolbarButton>
-        <ToolbarButton onClick={redo} disabled={!future.length}>重做</ToolbarButton>
-        <ToolbarButton active={showGrid} onClick={() => setShowGrid((value) => !value)}>
-          {showGrid ? "隐藏网格" : "显示网格"}
-        </ToolbarButton>
-        <ToolbarButton active={snapToGrid} onClick={() => setSnapToGrid((value) => !value)}>
-          {snapToGrid ? "关闭吸附" : "吸附网格"}
-        </ToolbarButton>
-        <ToolbarButton active={smartAlign} onClick={() => setSmartAlign((value) => !value)}>
-          {smartAlign ? "关闭自动对齐" : "自动对齐"}
-        </ToolbarButton>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="application/json,.json"
-          onChange={importJsonFile}
-          style={{ display: "none" }}
-        />
-      </div>
-
-      <div style={{ display: "flex", gap: 16, alignItems: "flex-start" }}>
-        <div
-          style={{
-            overflowX: "auto",
-            paddingBottom: 12,
-            flex: "1 1 auto",
-            minWidth: 0,
+      {draftProject && (
+        <DraftRecoveryBar
+          title={draftProject.title}
+          onRestore={() => {
+            projectRef.current = draftProject;
+            diagramDataRef.current = draftProject.data as DiagramData;
+            setProject(draftProject);
+            setDraftProject(null);
+            setPast([]);
+            setFuture([]);
+            showToast("已恢复本地草稿。", "success");
           }}
-        >
-          <div
-            style={{
-              width: CANVAS.width,
-              background: "#FFFFFF",
-              borderRadius: 10,
-              boxShadow: "0 12px 34px rgba(15, 23, 42, 0.12)",
-            }}
-          >
+          onDismiss={() => setDraftProject(null)}
+        />
+      )}
+
+      <TopBar
+        project={project}
+        editMode={editMode}
+        canUndo={Boolean(past.length)}
+        canRedo={Boolean(future.length)}
+        showGrid={showGrid}
+        snapToGrid={snapToGrid}
+        smartAlign={smartAlign}
+        zoom={zoom}
+        onProjectTitleChange={(title) => updateProject({ title })}
+        onToggleEditMode={() => setEditMode((value) => !value)}
+        onSave={saveLocal}
+        onExportJson={exportJson}
+        onImportJson={() => fileInputRef.current?.click()}
+        onExportSvg={exportSvg}
+        onExportPng={exportPng}
+        onReset={resetDefault}
+        onUndo={undo}
+        onRedo={redo}
+        onToggleGrid={() => setShowGrid((value) => !value)}
+        onToggleSnap={() => setSnapToGrid((value) => !value)}
+        onToggleSmartAlign={() => setSmartAlign((value) => !value)}
+        onZoomChange={setZoom}
+      />
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="application/json,.json"
+        onChange={importJsonFile}
+        style={{ display: "none" }}
+      />
+
+      <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+        <LeftPalette
+          relationCreateFrom={
+            relationMode ? relationCreateFrom ?? "请选择起点节点" : undefined
+          }
+          selectedRelationKind={selectedRelationKind}
+          onAddNode={addNode}
+          onRelationKindChange={setSelectedRelationKind}
+          onStartRelation={() => {
+            setEditMode(true);
+            setRelationMode(true);
+            setRelationCreateFrom(undefined);
+            showToast("请在画布上点击关系起点节点。", "info");
+          }}
+          onCancelRelation={() => {
+            setRelationMode(false);
+            setRelationCreateFrom(undefined);
+          }}
+        />
+
+        <CanvasFrame width={project.canvas.width} zoom={zoom} panEnabled={!editMode}>
             <svg
               ref={svgRef}
-              width={CANVAS.width}
-              height={CANVAS.height}
-              viewBox={`0 0 ${CANVAS.width} ${CANVAS.height}`}
+              width={project.canvas.width}
+              height={project.canvas.height}
+              viewBox={`0 0 ${project.canvas.width} ${project.canvas.height}`}
               role="img"
-              aria-label="华贺库粮食短缺及多方权利主张关系图"
+              aria-label={project.title}
               onPointerMove={onPointerMove}
               onPointerUp={endDrag}
               onPointerCancel={endDrag}
               style={{
                 display: "block",
-                width: `${CANVAS.width}px`,
-                height: `${CANVAS.height}px`,
+                width: `${project.canvas.width * zoom}px`,
+                height: `${project.canvas.height * zoom}px`,
                 maxWidth: "none",
                 background: "#FFFFFF",
                 userSelect: editMode ? "none" : "auto",
@@ -2477,8 +2727,8 @@ export default function LegalRelationshipDiagram() {
               <rect
                 x={0}
                 y={0}
-                width={CANVAS.width}
-                height={CANVAS.height}
+                width={project.canvas.width}
+                height={project.canvas.height}
                 fill="#FFFFFF"
                 onPointerDown={() => editMode && setSelected(null)}
               />
@@ -2488,8 +2738,8 @@ export default function LegalRelationshipDiagram() {
                   data-editor-only="true"
                   x={0}
                   y={0}
-                  width={CANVAS.width}
-                  height={CANVAS.height}
+                  width={project.canvas.width}
+                  height={project.canvas.height}
                   fill="url(#editor-grid)"
                   pointerEvents="none"
                 />
@@ -2516,13 +2766,21 @@ export default function LegalRelationshipDiagram() {
                 ))}
               </g>
 
-              {diagramData.nodes.map((node) => (
+              {diagramData.nodes.filter((node) => node.visible !== false).map((node) => (
                 <NodeCard
                   key={node.id}
                   node={node}
                   editable={editMode}
+                  editing={editingNodeId === node.id}
                   selected={selected?.type === "node" && selected.id === node.id}
                   onPointerDown={(event) => beginNodeDrag(node, event)}
+                  onDoubleClick={(event) => {
+                    event.stopPropagation();
+                    setSelected({ type: "node", id: node.id });
+                    setEditingNodeId(node.id);
+                  }}
+                  onTextChange={(value) => updateNode(node.id, { text: value })}
+                  onEndTextEdit={() => setEditingNodeId(null)}
                 />
               ))}
 
@@ -2557,22 +2815,41 @@ export default function LegalRelationshipDiagram() {
               <Timeline items={diagramData.timelineItems} />
               <Legend items={diagramData.legendItems} />
             </svg>
-          </div>
-        </div>
+        </CanvasFrame>
 
-        {editMode && (
-          <PropertyPanel
-            selectedNode={selectedNode}
-            selectedEdge={selectedEdge}
-            renderedEdgePath={selectedRenderedEdge?.renderedPath}
-            selectedEdgePoints={selectedRenderedEdge?.editablePoints}
-            onNodeChange={updateNode}
-            onEdgeChange={updateEdge}
-            onDeleteNode={deleteNode}
-            onDeleteEdge={deleteEdge}
-          />
-        )}
+        <Inspector
+          project={project}
+          selectedNode={selectedNode}
+          selectedEdge={selectedEdge}
+          renderedEdgePath={selectedRenderedEdge?.renderedPath}
+          selectedEdgePoints={selectedRenderedEdge?.editablePoints}
+          onProjectChange={updateProject}
+          onCanvasChange={updateCanvas}
+          onNodeChange={updateNode}
+          onEdgeChange={updateEdge}
+          onDeleteNode={deleteNode}
+          onDeleteEdge={deleteEdge}
+        />
       </div>
+
+      <BottomPanel
+        activeTab={bottomTab}
+        issues={validationIssues}
+        timelineItems={diagramData.timelineItems}
+        jsonText={projectJsonText}
+        onTabChange={setBottomTab}
+      />
+
+      <ToastHost toasts={toasts} />
+      <ConfirmDialog
+        request={confirmRequest?.request ?? null}
+        onCancel={() => setConfirmRequest(null)}
+        onConfirm={() => {
+          const action = confirmRequest?.onConfirm;
+          setConfirmRequest(null);
+          action?.();
+        }}
+      />
     </div>
   );
 }
